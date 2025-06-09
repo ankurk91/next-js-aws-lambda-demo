@@ -1,0 +1,12 @@
+node_modules
+*.log
+.git
+.github/
+.gitea/
+.vscode/
+.idea/
+/.next/
+Dockerfile
+.dockerignore
+.env
+.env.example
