@@ -9,10 +9,12 @@ RUN npm ci --no-audit
 COPY . .
 
 ARG NEXT_ASSET_PREFIX_URL
+ARG NEXT_APP_DOMAIN
 # Keep NODE_ENV line just before building, dont move this line up before "npm ci"
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV NEXT_ASSET_PREFIX_URL=$NEXT_ASSET_PREFIX_URL
+ENV NEXT_APP_DOMAIN=$NEXT_APP_DOMAIN
 RUN npm run build -- --no-lint
 
 FROM public.ecr.aws/aws-cli/aws-cli:latest AS uploader
@@ -48,28 +50,37 @@ RUN touch assets-uploaded.txt
 
 FROM public.ecr.aws/docker/library/node:22-bookworm-slim AS runner
 
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.9.1 /lambda-adapter /opt/extensions/lambda-adapter
+COPY --from=ghcr.io/rails-lambda/crypteia-extension-debian:2 /opt /opt
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV KEEP_ALIVE_TIMEOUT=30
 # Reserved for next.js standalome build
 ENV PORT=5000
+# AWS Lambda Web adapter
+ENV AWS_LWA_PORT=$PORT
+ENV AWS_LWA_INVOKE_MODE=response_stream
 
-# curl is required for ECS health checks
-# Other packages required for node-canvas npm package
+# ca-certificates is required to make external HTTP calls
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
     ca-certificates \
     && update-ca-certificates --fresh \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
+USER node
+
 COPY --from=builder --chown=node:node /build/.next/standalone ./
 COPY --from=builder --chown=node:node /build/public ./public
+# AWS Lambda only allows to write into /tmp folder
+RUN mkdir -p /tmp/cache && ln -s /tmp/cache ./.next/cache
+
 # Workaround to ensure uploader stage is connected to final stage
 COPY --from=uploader /files/assets-uploaded.txt ./
 
 EXPOSE $PORT
-USER node
+ENV LD_PRELOAD=/opt/lib/libcrypteia.so
 CMD ["node", "server.js"]
 

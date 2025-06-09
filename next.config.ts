@@ -20,6 +20,12 @@ const config = (phase: string) => {
                 //
             ],
         },
+        experimental: {
+            serverActions: {
+                // Required when running via lambda function URLs
+                allowedOrigins: ['*.' + process.env.NEXT_APP_DOMAIN],
+            },
+        },
         compiler: {
             removeConsole: isDev ? false : {
                 exclude: ["error", "warn"]
