@@ -1,0 +1,133 @@
+name: deployment
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  SanityChecks:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js environment
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint app code
+        run: npm run lint
+
+      - name: Check Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          failure-threshold: error
+
+  Deployment:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    needs: [ SanityChecks ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set environment variables
+        run: |
+          set -euo pipefail
+
+          case "${GITHUB_REF_NAME}" in
+            "staging")
+              ECR_REPOSITORY_NAME="${{ vars.STAGING_ECR_REPOSITORY_NAME }}"
+              LAMBDA_FUNCTION_NAME="${{ vars.STAGING_LAMBDA_FUNCTION_NAME }}"
+          
+              NEXT_ASSET_BUCKET_NAME="${{ vars.STAGING_NEXT_ASSET_BUCKET_NAME }}"         
+              NEXT_ASSET_PREFIX_URL="${{ vars.STAGING_NEXT_ASSET_PREFIX_URL }}"         
+              NEXT_APP_DOMAIN="${{ vars.STAGING_NEXT_APP_DOMAIN }}"         
+              ;;
+            "main")
+              ECR_REPOSITORY_NAME="${{ vars.PROD_ECR_REPOSITORY_NAME }}"
+              LAMBDA_FUNCTION_NAME="${{ vars.PROD_LAMBDA_FUNCTION_NAME }}"
+          
+              NEXT_ASSET_BUCKET_NAME="${{ vars.PROD_NEXT_ASSET_BUCKET_NAME }}"
+              NEXT_ASSET_PREFIX_URL="${{ vars.PROD_NEXT_ASSET_PREFIX_URL }}"
+              NEXT_APP_DOMAIN="${{ vars.PROD_NEXT_APP_DOMAIN }}"
+              ;;
+            *)
+              echo "Branch not matched. Exiting."
+              exit 1
+              ;;
+          esac
+          
+          echo "ECR_IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
+          echo "ECR_REPOSITORY_NAME=${ECR_REPOSITORY_NAME}" >> $GITHUB_ENV
+          echo "LAMBDA_FUNCTION_NAME=${LAMBDA_FUNCTION_NAME}" >> $GITHUB_ENV
+          
+          echo "NEXT_ASSET_BUCKET_NAME=${NEXT_ASSET_BUCKET_NAME}" >> $GITHUB_ENV
+          echo "NEXT_ASSET_PREFIX_URL=${NEXT_ASSET_PREFIX_URL}" >> $GITHUB_ENV
+          echo "NEXT_APP_DOMAIN=${NEXT_APP_DOMAIN}" >> $GITHUB_ENV
+          
+          echo "Environment variables set successfully."
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push to ECR
+        uses: docker/build-push-action@v6
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        with:
+          provenance: false
+          platforms: linux/arm64
+          context: .
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY_NAME }}:${{ env.ECR_IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY_NAME }}:latest
+          build-args: |
+            NEXT_ASSET_BUCKET_NAME=${{ env.NEXT_ASSET_BUCKET_NAME }}
+            NEXT_ASSET_PREFIX_URL=${{ env.NEXT_ASSET_PREFIX_URL }}
+            NEXT_APP_DOMAIN=${{ env.NEXT_APP_DOMAIN }}
+          secrets: |
+            AWS_ACCESS_KEY_ID=${{ env.AWS_ACCESS_KEY_ID }}
+            AWS_SECRET_ACCESS_KEY=${{ env.AWS_SECRET_ACCESS_KEY }}
+            AWS_SESSION_TOKEN=${{ env.AWS_SESSION_TOKEN }}
+            AWS_REGION=${{ vars.AWS_REGION }}  
+
+      - name: Deploy to lambda function
+        env:
+          ECR_IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_NAME }}:${{ env.ECR_IMAGE_TAG }}
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+            --image-uri ${{ env.ECR_IMAGE_URI }}            
+
+      - name: Wait for lambda function to update
+        run: aws lambda wait function-updated --function-name ${{ env.LAMBDA_FUNCTION_NAME }}
+
+      - name: Invoke and test lambda
+        env:
+          LAMBDA_FUNCTION_NAME: ${{ env.LAMBDA_FUNCTION_NAME }}
+        run: ./.github/invoke-lambda.sh
